@@ -14,6 +14,8 @@ Use this skill to design or evolve a DGX-like but cleaner AI chip diagnostic fra
 - Put hardware semantics in C++ HAL: hide ioctl, sysfs, vendor SDK, register offsets, chip stepping differences, and topology quirks from Python.
 - Keep Python as orchestration: scheduling, policy loading, external tool execution, report generation, retry, timeout, and workflow composition.
 - Use platform policy files for SKU/topology/threshold/concurrency differences instead of scattering platform conditionals through tests.
+- Model resource occupancy explicitly: every test should declare logical devices and shared physical resources such as fabric, PCIe domains, DMA engines, rings, descriptor pools, reset controllers, BMC, NUMA nodes, and telemetry channels.
+- Treat concurrent submit paths as first-class resources: tests should compete for scheduler leases, while HAL owns descriptor allocation, ring updates, doorbells, polling, completion attribution, cancel, and drain.
 - Prefer structured APIs and structured outputs: JSON/YAML/protobuf/result objects over ad hoc log scraping where tools allow it.
 - Make every layer mockable: provide fake HAL and dry-run tool adapters early.
 
@@ -32,11 +34,11 @@ C++ HAL
   -> pybind11/C ABI/gRPC bindings as needed
 
 Python framework
-  -> CLI, testcase registry, scheduler, resource manager, process manager
+  -> CLI, testcase registry, resource-aware scheduler, lease manager, process manager
   -> policy engine, external tool adapters, monitor service, result store
 
 Specs and policies
-  -> run specs, platform policies, thresholds, expected inventory, concurrency rules
+  -> run specs, platform policies, thresholds, expected inventory, resource locks, concurrency rules
 
 Packaging and release
   -> build HAL/Python/kernel artifacts, install runtime layout, DKMS/no-kmod modes, deb packaging
@@ -47,21 +49,25 @@ Packaging and release
 - Kernel module API to HAL: use stable UAPI structs with `size`, `version`, `flags`, and reserved fields. For the thin-kmod MVP, expose only `GET_VERSION`, device attach/open if needed, `DMA_ALLOC`, `DMA_FREE`, `mmap`, and optional cache sync. Return a device-visible DMA address/IOVA, not a guessed CPU physical address.
 - HAL low-level access: keep BAR/MMIO access, PCI config space access, DMA descriptor programming, doorbell writes, and polling completion in C++ HAL when user-space access is safe through VFIO, sysfs, vendor SDK, or a controlled mapping.
 - HAL API to Python: expose coarse operations such as `discover()`, `get_topology()`, `read_telemetry(device)`, `run_primitive(name, device, options)`, `reset_device(device, mode)`, and `subscribe_events(device)`.
+- HAL submit API: expose session-scoped `submit_job()`, `wait_job()`, `cancel_job()`, and `drain_queue()` operations when tests program hardware work queues. Attach `test_id`, `session_id`, `device_id`, `queue_id`, descriptor identity, timeout, and artifact paths to every job.
 - Python to external tools: use a `ToolAdapter` abstraction that owns argv construction, timeout, environment, log paths, process cleanup, and parsers.
-- Policy to scheduler: express resource locks and concurrency rules declaratively, for example `chip:{device}`, `pcie_domain:{domain}`, `bmc`, `numa:{node}`.
+- Policy to scheduler: express resource locks and concurrency rules declaratively, for example `chip:{device}`, `hbm:{device}`, `fabric:{id}`, `pcie_domain:{domain}`, `dma_engine:{id}`, `ring:{queue_id}`, `descriptor_pool:{id}`, `reset_controller:{domain}`, `bmc`, `numa:{node}`.
+- Scheduler to HAL: acquire leases before submit; reject or queue conflicting tests before they reach BAR/MMIO, reset, DMA engine, ringbuffer, or descriptor operations. Keep the default kernel module outside this path except for DMA-safe memory allocation/mapping.
 - Packaging to runtime: install CLI, HAL shared library, Python package, policies, specs, schemas, tools, udev/systemd/logrotate files, and optional DKMS kernel module in predictable filesystem locations.
 
 ## Design Workflow
 
 1. Identify target devices: accelerators, HBM, switches, PCIe links, NVMe, NIC/IB, CPU, DIMM, fans, PSU, BMC/HMC, sensors.
 2. Define logical naming and topology: map BDF/sysfs/vendor identifiers to stable names such as `CHIP_0`, `OAM_1`, `NVME_3`, `NIC_1`.
-3. Define schemas and result model before writing tests.
-4. Build a minimal Python runner with fake HAL: inventory, policy validation, one testcase, logs, and result JSON.
-5. Add external tool tests first when useful, especially FIO/NVMe, because they validate orchestration without custom kernel work.
-6. Add C++ HAL discovery and telemetry next.
-7. Add the thinnest kernel module only when DMA-safe memory/IOMMU mapping, privileged mapping, or lifecycle cleanup cannot be safely obtained from VFIO, vendor SDKs, or existing drivers.
-8. Add packaging early enough that the CLI, HAL, policies, specs, and optional kmod can be installed and smoke-tested as a deb.
-9. Expand to stress, burn-in, thermal, multi-device, and multi-node tests once resource scheduling is solid.
+3. Define the resource graph: map logical devices to shared physical resources such as fabric, PCIe domains, DMA engines, hardware rings, descriptor pools, reset domains, BMC channels, and thermal/power domains.
+4. Define schemas and result model before writing tests.
+5. Build a minimal Python runner with fake HAL: inventory, policy validation, lease validation, one testcase, logs, and result JSON.
+6. Add external tool tests first when useful, especially FIO/NVMe, because they validate orchestration without custom kernel work.
+7. Add C++ HAL discovery and telemetry next.
+8. Add a submit queue manager when tests program hardware queues. Centralize descriptor allocation, ring tail/head updates, doorbells, completion attribution, timeout, cancel, drain, reset coordination, and process-crash cleanup.
+9. Add the thinnest kernel module only when DMA-safe memory/IOMMU mapping, privileged mapping, or lifecycle cleanup cannot be safely obtained from VFIO, vendor SDKs, or existing drivers.
+10. Add packaging early enough that the CLI, HAL, policies, specs, and optional kmod can be installed and smoke-tested as a deb.
+11. Expand to stress, burn-in, thermal, multi-device, and multi-node tests once resource scheduling is solid.
 
 ## Recommended First Milestones
 
@@ -70,13 +76,16 @@ Packaging and release
 - Milestone 2: real `nvme_fio` testcase via `ToolAdapter`.
 - Milestone 3: C++ HAL `discover()` and `read_telemetry()`, exposed to Python.
 - Milestone 4: thin kernel module or VFIO path for DMA-safe buffer allocation/mapping and `mmap`.
-- Milestone 5: resource-aware scheduler and monitor service.
-- Milestone 6: deb packaging with no-kmod and DKMS-kmod modes, runtime layout, udev, and install smoke test.
-- Milestone 7: chip memory, DMA, PCIe, thermal, reset, and burn-in suites.
+- Milestone 5: resource graph and lease-aware scheduler with exclusive/shared locks for logical devices and shared physical resources.
+- Milestone 6: submit queue manager for hardware queue tests: session ownership, descriptor allocator, ringbuffer arbitration, doorbell, completion attribution, drain/cancel/reset, and cleanup.
+- Milestone 7: deb packaging with no-kmod and DKMS-kmod modes, runtime layout, udev, and install smoke test.
+- Milestone 8: chip memory, DMA, PCIe, thermal, reset, and burn-in suites.
 
 ## Reference Loading
 
 Read `references/framework-blueprint.md` when the user asks for concrete directory layout, interface examples, policy schema, testcase contracts, or a fuller DGX-inspired architecture.
+
+Read `references/resource-concurrency-model.md` when the user asks about device occupancy, concurrent tests, resource conflicts, shared physical resources, submit queues, ringbuffers, descriptors, leases, scheduler policy, or how to compare DGX/Chameleon-like concurrency models.
 
 Read `references/hal-cpp-headers.md` when the user asks to make the C++ HAL API concrete, create header files, review HAL interface boundaries, or design Python bindings around the HAL.
 
