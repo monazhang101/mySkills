@@ -4,22 +4,22 @@ Use this reference to design the concrete implementation for device occupancy, p
 
 ## Design Goal
 
-Prevent multiple tests from accidentally contending for the same physical resource.
+Prevent multiple tests from accidentally contending for the same physical resource while keeping the framework small enough to build first.
 
 Core rule:
 
 ```text
-Tests compete for scheduler leases.
-Tests do not directly compete for ringbuffers, descriptors, reset domains, DMA engines, or shared fabrics.
+Tests compete for scheduler leases over LogicalDevices.
+Tests do not directly compete for ringbuffers or descriptors; HAL owns those details.
 ```
 
-Target architecture:
+Default MVP architecture:
 
 ```text
 TestSpec / Policy
-  -> declare required resources
-ResourceGraph
-  -> map logical devices to shared physical resources
+  -> declare shared/exclusive LogicalDevice locks
+LogicalDevice Registry
+  -> name physical and virtual/domain nodes
 LeaseManager / Scheduler
   -> grant exclusive/shared leases
 Device WorkQueue
@@ -36,18 +36,133 @@ Hardware
 Default split:
 
 ```text
-framework owns scheduling and leases
+framework owns LogicalDevice registry, scheduling, and leases
 HAL owns sessions, descriptors, rings, doorbells, polling, completion attribution, cancel, and drain
 kernel owns DMA-safe buffer allocation/mapping only
 ```
 
-Move submit/wait/cancel/drain into the kernel only as a future heavy-kmod mode when user-space HAL ownership cannot provide enough crash safety, interrupt ownership, or reset safety.
+Move submit/wait/cancel/drain into the kernel only as a future heavy-kmod mode when user-space HAL ownership cannot provide enough crash safety, interrupt ownership, multi-process arbitration, or reset safety.
 
-## Resource Model
+## LogicalDevice-First Model
 
-Represent all contended objects as resources with stable IDs.
+Expose everything the user can select, inspect, or lock as a LogicalDevice. A LogicalDevice may be physical, virtual, or a domain.
 
-Recommended resource namespaces:
+Examples:
+
+```text
+TPU_0                 physical AI chip with HAL backend
+SWITCH_0              physical switch ASIC with optional HAL backend
+FABRIC_0              virtual/domain device for shared fabric occupancy
+PCIE_DOMAIN_0         virtual/domain device for PCIe subtree occupancy
+RESET_DOMAIN_0        virtual/domain device for reset blast radius
+POWER_DOMAIN_0        virtual/domain device for power budget occupancy
+THERMAL_DOMAIN_0      virtual/domain device for thermal coupling
+TELEMETRY_0           virtual/domain device for sensor/log channel
+BMC_0                 physical or service device for BMC/IPMI/Redfish access
+```
+
+Recommended schema:
+
+```yaml
+logical_devices:
+  TPU_0:
+    kind: physical
+    type: ai_chip
+    has_hal_backend: true
+    parents: [FABRIC_0, PCIE_DOMAIN_0, RESET_DOMAIN_0, POWER_DOMAIN_0]
+
+  SWITCH_0:
+    kind: physical
+    type: fabric_switch
+    has_hal_backend: true
+    parents: [FABRIC_0]
+
+  FABRIC_0:
+    kind: virtual
+    type: fabric_domain
+    has_hal_backend: false
+    children: [TPU_0, TPU_1, TPU_2, TPU_3, TPU_4, TPU_5, TPU_6, TPU_7, SWITCH_0]
+```
+
+MVP lease modes:
+
+```text
+exclusive       no other exclusive/shared lease may overlap
+shared          compatible with other shared leases
+```
+
+Conflict rules:
+
+```text
+exclusive vs exclusive -> conflict
+exclusive vs shared    -> conflict
+shared vs shared       -> allowed
+```
+
+Acquire locks in a deterministic global order, such as sorted LogicalDevice ID, to avoid deadlocks.
+
+Use lock groups to reduce policy repetition:
+
+```yaml
+lock_groups:
+  FABRIC_0_FULL:
+    exclusive:
+      - FABRIC_0
+      - SWITCH_0
+      - TPU_0
+      - TPU_1
+      - TPU_2
+      - TPU_3
+      - TPU_4
+      - TPU_5
+      - TPU_6
+      - TPU_7
+```
+
+## Policy Schema
+
+Each test declares the LogicalDevices it touches. The scheduler expands `${device}` and lock groups before execution.
+
+```yaml
+tests:
+  gpumem:
+    parallelism: per_device
+    locks:
+      exclusive:
+        - ${device}
+      shared:
+        - TELEMETRY_0
+
+  dma_submit:
+    parallelism: per_device
+    locks:
+      exclusive:
+        - ${device}
+      shared:
+        - TELEMETRY_0
+
+  fabric_stress_8chip:
+    parallelism: inside_test
+    locks:
+      exclusive_groups:
+        - FABRIC_0_FULL
+      shared:
+        - TELEMETRY_0
+
+  pcie_reset:
+    parallelism: sequential_by_domain
+    locks:
+      exclusive:
+        - PCIE_DOMAIN_0
+        - RESET_DOMAIN_0
+        - ${device}
+```
+
+## Optional ResourceGraph Model
+
+Add a richer ResourceGraph only when LogicalDevice locks become too repetitive or when topology-derived expansion is needed across fabrics, PCIe domains, reset domains, power domains, or multi-node systems.
+
+Represent contended objects as resources with stable IDs:
 
 ```text
 chip:<id>                 accelerator/GPU/AI chip
@@ -67,114 +182,7 @@ telemetry:<id>            read-only sensors/log streams
 numa:<id>                 CPU/NUMA locality resource
 ```
 
-Most testcase policies should declare semantic resources such as `chip`, `hbm`, `engine`, `ring`, `descriptor_pool`, `fabric`, `pcie_domain`, `reset_domain`, `bmc`, and `numa`. Treat `irq`, `mmap_region`, and `dma_iova` as HAL/kernel internal resources unless a test directly stresses those low-level objects.
-
-Lease modes:
-
-```text
-exclusive       no other exclusive/shared lease may overlap
-shared          compatible with other shared leases
-group_exclusive exclusive over a computed resource group, e.g. all devices in one fabric
-```
-
-Conflict rules:
-
-```text
-exclusive vs exclusive -> conflict
-exclusive vs shared    -> conflict
-shared vs shared       -> allowed
-```
-
-## Policy Schema
-
-Each test declares the resources it touches. The scheduler expands `${device}` and topology-derived variables before execution.
-
-```yaml
-tests:
-  gpumem:
-    parallelism: per_device
-    resources:
-      exclusive:
-        - chip:${device}
-        - hbm:${device}
-        - engine:${device}:mem
-      shared:
-        - telemetry:${device}
-
-  dma_submit:
-    parallelism: per_device
-    resources:
-      exclusive:
-        - chip:${device}
-        - engine:${device}:dma0
-        - ring:${device}:dma0
-        - descriptor_pool:${device}:dma0
-      shared:
-        - telemetry:${device}
-
-  fabric_link:
-    parallelism: per_fabric
-    resources:
-      group_exclusive:
-        - fabric:${fabric_id}
-        - switch:${fabric_switches}
-      shared:
-        - chip:${fabric_devices}
-
-  pcie_reset:
-    parallelism: sequential_by_domain
-    resources:
-      exclusive:
-        - pcie_domain:${domain}
-        - reset_domain:${domain}
-        - chip:${device}
-```
-
-## Resource Graph Schema
-
-Build a topology-derived graph at discovery time.
-
-```yaml
-devices:
-  CHIP_0:
-    bdf: "0000:81:00.0"
-    resources:
-      - chip:CHIP_0
-      - hbm:CHIP_0
-      - pcie_domain:0000
-      - reset_domain:pcie_root_0
-      - fabric:fabric_0
-      - engine:CHIP_0:dma0
-      - ring:CHIP_0:dma0
-      - descriptor_pool:CHIP_0:dma0
-      - telemetry:CHIP_0
-
-  CHIP_1:
-    bdf: "0000:82:00.0"
-    resources:
-      - chip:CHIP_1
-      - hbm:CHIP_1
-      - pcie_domain:0000
-      - reset_domain:pcie_root_0
-      - fabric:fabric_0
-      - engine:CHIP_1:dma0
-      - ring:CHIP_1:dma0
-      - descriptor_pool:CHIP_1:dma0
-      - telemetry:CHIP_1
-
-groups:
-  fabric:fabric_0:
-    members:
-      - chip:CHIP_0
-      - chip:CHIP_1
-      - switch:SWITCH_0
-
-  reset_domain:pcie_root_0:
-    members:
-      - chip:CHIP_0
-      - chip:CHIP_1
-      - pcie_domain:0000
-```
+Treat `ring`, `descriptor_pool`, `irq`, `mmap_region`, and `dma_iova` as HAL/kernel internal resources unless a test directly stresses those low-level objects.
 
 ## Python Framework Interfaces
 
@@ -183,37 +191,35 @@ Define explicit scheduler contracts.
 ```python
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable
 
 class LeaseMode(str, Enum):
     EXCLUSIVE = "exclusive"
     SHARED = "shared"
-    GROUP_EXCLUSIVE = "group_exclusive"
 
 @dataclass(frozen=True)
-class ResourceRef:
-    namespace: str
-    identifier: str
+class LogicalDeviceId:
+    value: str
 
 @dataclass(frozen=True)
-class ResourceRequest:
-    resource: ResourceRef
+class DeviceLockRequest:
+    device: LogicalDeviceId
     mode: LeaseMode
 
 @dataclass
 class Lease:
     lease_id: str
     owner_test_id: str
-    resources: list[ResourceRequest]
+    locks: list[DeviceLockRequest]
     deadline_ms: int
 
-class ResourceGraph:
-    def resources_for_device(self, logical_device: str) -> set[ResourceRef]: ...
-    def expand_group(self, resource: ResourceRef) -> set[ResourceRef]: ...
-    def expand_test_policy(self, test_name: str, device: str, args: dict) -> list[ResourceRequest]: ...
+class LogicalDeviceRegistry:
+    def get(self, device_id: str) -> LogicalDevice: ...
+    def children_of(self, device_id: str) -> list[LogicalDeviceId]: ...
+    def expand_lock_group(self, group_id: str) -> list[DeviceLockRequest]: ...
+    def expand_test_policy(self, test_name: str, targets: list[str], args: dict) -> list[DeviceLockRequest]: ...
 
 class LeaseManager:
-    def try_acquire(self, owner_test_id: str, requests: list[ResourceRequest], timeout_ms: int) -> Lease: ...
+    def try_acquire(self, owner_test_id: str, requests: list[DeviceLockRequest], timeout_ms: int) -> Lease: ...
     def release(self, lease: Lease) -> None: ...
     def heartbeat(self, lease: Lease) -> None: ...
 ```
@@ -223,9 +229,7 @@ Scheduler pseudocode:
 ```python
 class Scheduler:
     def run_test(self, test, target_devices):
-        requests = []
-        for dev in target_devices:
-            requests.extend(self.resource_graph.expand_test_policy(test.name, dev, test.args))
+        requests = self.devices.expand_test_policy(test.name, target_devices, test.args)
 
         lease = self.lease_manager.try_acquire(
             owner_test_id=test.id,
@@ -242,14 +246,13 @@ class Scheduler:
 Conflict check:
 
 ```python
-def conflicts(existing: ResourceRequest, requested: ResourceRequest) -> bool:
-    if existing.resource != requested.resource:
+def conflicts(existing: DeviceLockRequest, requested: DeviceLockRequest) -> bool:
+    if existing.device != requested.device:
         return False
-    return LeaseMode.EXCLUSIVE in (existing.mode, requested.mode) or \
-           LeaseMode.GROUP_EXCLUSIVE in (existing.mode, requested.mode)
+    return LeaseMode.EXCLUSIVE in (existing.mode, requested.mode)
 ```
 
-Expand `group_exclusive` requests before conflict checking, or have `LeaseManager` call `ResourceGraph.expand_group()` internally. Without expansion, a lease on `fabric:fabric_0` will not conflict with a request for `chip:CHIP_0` even when that chip belongs to the fabric group.
+Expand lock groups before conflict checking. Without expansion, a lease on `FABRIC_0_FULL` will not conflict with a request for `TPU_0` unless `TPU_0` is materialized as an acquired lock.
 
 Device-local work queue:
 
@@ -270,7 +273,7 @@ class LogicalDeviceExecutor:
                 self.queues[device_id].task_done()
 ```
 
-Use the device-local queue for same-logical-device serialization. Use the LeaseManager for shared physical resources that span multiple logical devices.
+Use the device-local queue for same-LogicalDevice serialization when needed. Use the LeaseManager for cross-device occupancy such as fabric, PCIe domain, reset, power, thermal, BMC, or telemetry.
 
 ## HAL Interfaces
 
@@ -278,7 +281,7 @@ Expose session-scoped operations. A session must carry an active scheduler lease
 
 ```cpp
 struct DeviceId {
-    std::string value;  // Stable logical ID such as CHIP_0.
+    std::string value;  // Stable logical ID such as TPU_0, FABRIC_0, or BMC_0.
 };
 
 struct LeaseToken {
@@ -488,8 +491,8 @@ Any reset, link retrain, firmware reload, power transition, or fabric reconfigur
 Protocol:
 
 ```text
-1. Scheduler acquires exclusive reset_domain lease.
-2. Scheduler blocks new submits for affected resources.
+1. Scheduler acquires exclusive `RESET_DOMAIN_0` and affected device leases.
+2. Scheduler blocks new submits for affected LogicalDevices.
 3. HAL calls Quiesce() for affected sessions.
 4. SubmitQueueManager drains or cancels in-flight jobs.
 5. HAL verifies no owned descriptors remain active.
@@ -537,7 +540,7 @@ Every result should include:
   "lease_id": "lease-123",
   "session_id": "session-456",
   "device_id": "CHIP_0",
-  "resources": ["chip:CHIP_0", "hbm:CHIP_0", "ring:CHIP_0:dma0"],
+  "locks": ["CHIP_0", "FABRIC_0", "SWITCH_0"],
   "job_id": 99,
   "queue_id": 0,
   "descriptor_id": 12,
@@ -560,7 +563,7 @@ diag/
     diag_runner/
       scheduler.py
       lease_manager.py
-      resource_graph.py
+      logical_device_registry.py
       logical_device_executor.py
       process_manager.py
       tool_adapter.py
@@ -588,12 +591,12 @@ diag/
 
 ## Implementation Checklist
 
-- Define logical devices and topology-derived shared resources.
-- Require every testcase to declare resource requests before execution.
+- Define physical and virtual LogicalDevices.
+- Require every testcase to declare LogicalDevice locks before execution.
 - Validate policies in dry-run mode.
 - Implement lease conflict detection before running any test.
 - Serialize same-logical-device tasks with a device work queue.
-- Lock shared physical resources with scheduler leases.
+- Lock shared physical/domain LogicalDevices with scheduler leases.
 - Centralize hardware queue submission in HAL by default.
 - Track session/job/descriptor/buffer ownership in HAL, and buffer/mmap ownership in the thin kernel module.
 - Enforce DMA buffer cleanup in kernel file release; handle submit crash safety through supervised HAL ownership or future heavy-kmod mode.

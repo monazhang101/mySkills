@@ -43,7 +43,7 @@ ai-diag/
       runner.py
       registry.py
       scheduler.py
-      resource_manager.py
+      logical_device_registry.py
       device_manager.py
       process_manager.py
       monitor.py
@@ -229,7 +229,8 @@ class TestCase:
     component: str
     required_tools: list[str]
     required_hal_caps: list[str]
-    resources: list[str]
+    locks_exclusive: list[str]
+    locks_shared: list[str]
     timeout_s: int
 
     def is_supported(self, ctx) -> bool: ...
@@ -245,7 +246,7 @@ Runner context should provide:
 - `ctx.topology`
 - `ctx.policy`
 - `ctx.tools`
-- `ctx.resources`
+- `ctx.leases`
 - `ctx.monitor`
 - `ctx.results`
 - `ctx.logs`
@@ -291,27 +292,43 @@ concurrency:
   max_chip_stress_parallel: 8
   max_fio_parallel: 4
   bmc_commands_serialized: true
-resources:
+lock_groups:
+  FABRIC_0_FULL:
+    exclusive:
+      - FABRIC_0
+      - SWITCH_0
+      - CHIP_0
+      - CHIP_1
+      - CHIP_2
+      - CHIP_3
+      - CHIP_4
+      - CHIP_5
+      - CHIP_6
+      - CHIP_7
+locks:
   pcie_reset:
     exclusive:
-      - pcie_domain:{domain}
+      - PCIE_DOMAIN_0
+      - RESET_DOMAIN_0
+      - "{device}"
   bmc:
     exclusive:
-      - bmc
+      - BMC_0
 ```
 
 ## Scheduler Model
 
-Represent tests as a DAG of tasks. Each task declares resource locks.
+Represent tests as a DAG of tasks. Each task declares LogicalDevice locks. LogicalDevices include physical nodes such as chips, SSDs, NICs, and switches, plus virtual/domain nodes such as fabrics, PCIe domains, reset domains, power domains, thermal domains, BMC channels, and telemetry channels.
 
 Examples:
 
-- `chip_mem(CHIP_0)` locks `chip:CHIP_0` and `hbm:CHIP_0`.
-- `nvme_fio(NVME_3)` locks `nvme:NVME_3` and possibly `numa:0`.
-- `pcie_reset(CHIP_0)` locks `pcie_domain:root0`.
-- BMC/IPMI/Redfish operations lock `bmc`.
+- `chip_mem(CHIP_0)` locks `CHIP_0`.
+- `fabric_stress(CHIP_0..CHIP_7)` locks `FABRIC_0_FULL` after expansion to `FABRIC_0`, `SWITCH_0`, and the eight chips.
+- `nvme_fio(NVME_3)` locks `NVME_3` and possibly `NUMA_0`.
+- `pcie_reset(CHIP_0)` locks `PCIE_DOMAIN_0`, `RESET_DOMAIN_0`, and `CHIP_0`.
+- BMC/IPMI/Redfish operations lock `BMC_0`.
 
-The scheduler may run independent tasks concurrently but must serialize conflicting locks.
+The MVP scheduler should support only `shared` and `exclusive` modes, acquire locks in deterministic LogicalDevice ID order, and serialize conflicting locks. Add a richer ResourceGraph only when policy repetition or topology-derived lock expansion becomes painful.
 
 ## Result Model
 
