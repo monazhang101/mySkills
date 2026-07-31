@@ -1,0 +1,7 @@
+interface:
+  display_name: "AI Chip Diag Architect"
+  short_description: "Design AI chip hardware diagnostic frameworks."
+  default_prompt: "Use $ai-chip-diag-architect to design or refine an AI chip hardware diagnostic framework."
+
+policy:
+  allow_implicit_invocation: true
