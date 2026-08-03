@@ -10,7 +10,7 @@ Core rule:
 
 ```text
 Tests compete for scheduler leases over LogicalDevices.
-Tests do not directly compete for ringbuffers or descriptors; HAL owns those details.
+Tests do not directly compete for ringbuffers or descriptors; UMD/HAL owns those details.
 ```
 
 Default MVP architecture:
@@ -21,27 +21,34 @@ TestSpec / Policy
 LogicalDevice Registry
   -> name physical and virtual/domain nodes
 LeaseManager / Scheduler
-  -> grant exclusive/shared leases
+  -> grant exclusive/shared leases; MVP Scheduler may be only a synchronous lease gate
 Device WorkQueue
   -> serialize tasks per logical device when needed
 HAL Session
-  -> owns device context and submit API
+  -> owns diagnostic context and coarse submit API
+UMD Session, when present
+  -> owns low-level device context, firmware descriptors, rings, and doorbells
 SubmitQueueManager
   -> allocate descriptors, update rings, ring doorbells, attribute completions
 Thin kernel module
-  -> enforce DMA-safe buffer allocation, IOMMU mapping, mmap ownership, and buffer cleanup
+  -> enforce the thinnest required memory/IRQ services, such as contiguous allocation/mmap and IRQ event delivery
 Hardware
 ```
 
 Default split:
 
 ```text
-framework owns LogicalDevice registry, scheduling, and leases
-HAL owns sessions, descriptors, rings, doorbells, polling, completion attribution, cancel, and drain
-kernel owns DMA-safe buffer allocation/mapping only
+framework owns LogicalDevice registry, scheduling facade, and cross-process leases
+HAL owns diagnostic submit semantics and wraps UMD when present
+UMD owns firmware descriptor mechanics, rings, doorbells, polling/IRQ wait, completion attribution, cancel, and drain when present
+kernel owns only the required privileged memory/IRQ services; in ultra-thin mode it does not own DMA or IOMMU mapping
 ```
 
-Move submit/wait/cancel/drain into the kernel only as a future heavy-kmod mode when user-space HAL ownership cannot provide enough crash safety, interrupt ownership, multi-process arbitration, or reset safety.
+For the MVP, keep the public API name `Scheduler` if that helps future extensibility, but implement it as a small wrapper around a cross-process `LeaseManager`. It should expand lock policy, acquire leases, run one testcase synchronously, release leases, and write lease metadata. It should not use a global CLI lock, because multiple CLI instances may safely run when their LogicalDevice leases do not conflict.
+
+Defer queueing, priority/fairness, worker pools, DAG dispatch, and automatic suite-level parallelism until the framework actually needs them.
+
+Move submit/wait/cancel/drain into the kernel only as a future heavy-kmod mode when user-space UMD/HAL ownership cannot provide enough crash safety, interrupt ownership, multi-process arbitration, or reset safety.
 
 ## LogicalDevice-First Model
 
@@ -142,7 +149,7 @@ tests:
         - TELEMETRY_0
 
   fabric_stress_8chip:
-    parallelism: inside_test
+    parallelism: inside_hal
     locks:
       exclusive_groups:
         - FABRIC_0_FULL
@@ -243,6 +250,8 @@ class Scheduler:
             self.lease_manager.release(lease)
 ```
 
+In MVP, this `Scheduler` is deliberately synchronous: it is not required to own a task queue or dispatch pool. Its main job is to make lease acquisition mandatory before any testcase reaches HAL, UMD, external tools, BAR/MMIO, reset, DMA submit, or shared telemetry/BMC paths.
+
 Conflict check:
 
 ```python
@@ -274,6 +283,29 @@ class LogicalDeviceExecutor:
 ```
 
 Use the device-local queue for same-LogicalDevice serialization when needed. Use the LeaseManager for cross-device occupancy such as fabric, PCIe domain, reset, power, thermal, BMC, or telemetry.
+
+## Multi-Device Stress Boundary
+
+For strongly coupled multi-device diagnostics, Python should acquire the full lease set and call one coarse HAL primitive. Examples include 8-chip stress, fabric stress, collective bandwidth, thermal stress, synchronized power stress, and tests that require aligned start/stop timing.
+
+Recommended flow:
+
+```text
+Python Scheduler
+  -> acquire exclusive CHIP_0..CHIP_7 plus affected FABRIC/POWER/THERMAL domains
+  -> call HAL run_primitive("chip_stress", devices=[...], lease=token, options={...})
+  -> collect structured per-device results and artifacts
+
+HAL/UMD
+  -> open sessions
+  -> create per-device workers and queues
+  -> synchronize start barrier
+  -> submit work, attribute completions, monitor errors
+  -> apply fail policy
+  -> timeout, cancel, drain, cleanup
+```
+
+Python fan-out is acceptable for independent per-device tests and external tool adapters. DGX `gpustress` follows a Python multi-instance MODS pattern, but treat that as a tool-adapter/legacy shape rather than the preferred HAL/UMD boundary for tightly synchronized chip diagnostics.
 
 ## HAL Interfaces
 
@@ -493,10 +525,10 @@ Protocol:
 ```text
 1. Scheduler acquires exclusive `RESET_DOMAIN_0` and affected device leases.
 2. Scheduler blocks new submits for affected LogicalDevices.
-3. HAL calls Quiesce() for affected sessions.
+3. HAL calls Quiesce() for affected sessions, delegating to UMD when UMD owns the queues.
 4. SubmitQueueManager drains or cancels in-flight jobs.
-5. HAL verifies no owned descriptors remain active.
-6. Kernel retains only DMA buffer/mmap ownership unless heavy-kmod mode is enabled.
+5. UMD/HAL verifies no owned descriptors remain active.
+6. Kernel retains only memory/mmap/IRQ ownership unless heavy-kmod mode is enabled.
 7. HAL performs reset/retrain/reconfigure.
 8. HAL reinitializes queue state and telemetry.
 9. Scheduler releases lease.
