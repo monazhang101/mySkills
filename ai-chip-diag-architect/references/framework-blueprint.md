@@ -2,9 +2,11 @@
 
 ## Goals
 
-Design a hardware diagnostic framework for AI accelerator platforms that improves on DGX-style packaging by making the C++ HAL the stable semantic layer and keeping Python focused on orchestration. When a platform provides a UMD/User Mode Driver, treat UMD as the low-level firmware descriptor and queue owner below HAL.
+Design a hardware diagnostic framework for AI accelerator platforms by making the C++ HAL the stable semantic layer and keeping Python focused on orchestration. When a platform provides a UMD/User Mode Driver, treat UMD as the low-level firmware descriptor and queue owner below HAL.
 
 ## Suggested Repository Layout
+
+Use the compact Python MVP layout as the default starting point. The fuller framework split below is a growth path, not the first implementation target.
 
 ```text
 ai-diag/
@@ -32,7 +34,7 @@ ai-diag/
       device.h
       topology.h
       telemetry.h
-      test_primitive.h
+      atomic_test.h
       platform.h
       result.h
       error.h
@@ -44,39 +46,26 @@ ai-diag/
       topology_service.cpp
       platform_policy.cpp
       telemetry_service.cpp
-      primitive_runner.cpp
+      atomic_test_runner.cpp
     bindings/
       pybind_module.cpp
 
   framework/
     aidiag/
-      cli.py
-      context.py
+      main.py
+      config.py
       runner.py
-      registry.py
-      scheduler.py
-      lease_manager.py
-      logical_device_registry.py
-      device_manager.py
-      process_manager.py
-      monitor.py
-      result_store.py
-      policy_engine.py
-      tool_adapter.py
-      parsers/
-        fio.py
-        stress_ng.py
-        vendor_diag.py
       tests/
-        inventory.py
-        chip_smoke.py
-        chip_mem.py
-        chip_dma.py
-        chip_stress.py
-        pcie.py
+        __init__.py
+        connectivity_check.py
         nvme_fio.py
-        thermal.py
-        reset.py
+
+  schemas/
+    test_config.schema.yaml
+
+  examples/
+    connectivity_check.yaml
+    production_sequence.yaml
 
   policies/
     generic.yaml
@@ -105,6 +94,14 @@ ai-diag/
   reports/
   logs/
 ```
+
+Split the Python MVP only when real pressure appears:
+
+- `runner.py` -> `scheduler.py` / `lease_manager.py` when lease acquisition, heartbeats, stale cleanup, wait policy, or concurrency handling make the runner hard to read. A small cross-process lease gate should live in `runner.py` for the MVP.
+- `runner.py` -> `tool_adapter.py` and `parsers/` when external tool wrappers and parsers become repetitive.
+- `runner.py` -> `result_store.py` when JSON report writing grows into querying, upload, or multi-format reporting.
+- `config.py` -> `policy_engine.py` / `logical_device_registry.py` when SKU, topology, threshold, lock group, and support rules outgrow simple config helpers.
+- `tests/` -> richer testcase support modules when common testcase validation, retry, skip, or subresult logic becomes repetitive.
 
 ## Kernel Module Contract
 
@@ -207,7 +204,7 @@ public:
     virtual void Subscribe(const Device&, EventCallback cb) = 0;
 };
 
-class ITestPrimitive {
+class IAtomicTest {
 public:
     virtual TestResult MemorySelfTest(const Device&, const MemoryTestOptions&) = 0;
     virtual TestResult DmaLoopback(const Device&, const DmaOptions&) = 0;
@@ -222,21 +219,21 @@ Python binding should expose coarse methods:
 hal.discover()
 hal.get_topology()
 hal.read_telemetry("CHIP_0")
-hal.run_primitive("memory_selftest", device="CHIP_0", options={})
+hal.run_atomic_test("memory_selftest", device="CHIP_0", args={})
 hal.reset_device("CHIP_0", mode="flr")
 ```
 
-For tightly synchronized multi-device diagnostics, expose one coarse HAL primitive instead of making Python own per-device worker threads:
+For tightly synchronized multi-device diagnostics, expose one coarse HAL atomic test instead of making Python own per-device worker threads:
 
 ```python
-hal.run_primitive(
+hal.run_group_atomic_test(
     "chip_stress",
     devices=["CHIP_0", "CHIP_1", "CHIP_2", "CHIP_3", "CHIP_4", "CHIP_5", "CHIP_6", "CHIP_7"],
-    options={"duration_s": 600, "start_barrier": True, "fail_policy": "stop_all_on_first_error"},
+    args={"duration_s": 600, "start_barrier": True, "fail_policy": "stop_all_on_first_error"},
 )
 ```
 
-HAL/UMD should own the internal workers, start barrier, submit/completion attribution, timeout, cancel, drain, and cleanup for these strongly coupled tests. Python fan-out is still appropriate for independent per-device tests and external tools.
+Python decides the `devices` list from CLI/config/policy and must acquire leases for every target device and affected shared domain before calling HAL. HAL does not choose which devices participate; it validates the provided set and executes concurrently over exactly that set. HAL/UMD should own the internal workers, start barrier, submit/completion attribution, timeout, cancel, drain, and cleanup for these strongly coupled tests. Python fan-out is still appropriate for independent per-device tests and external tools.
 
 ## Packaging and Release Contract
 
@@ -260,52 +257,43 @@ For details, read `packaging-deb.md`.
 
 ## Python Framework Contracts
 
-Testcase interface:
+For the MVP, use a plain module-level testcase interface. Do not introduce a `TestCase` base class until repeated validation, retry, skip, planning, or parsing logic makes it worthwhile.
 
 ```python
-class TestCase:
-    name: str
-    component: str
-    required_tools: list[str]
-    required_hal_caps: list[str]
-    locks_exclusive: list[str]
-    locks_shared: list[str]
-    timeout_s: int
+name = "connectivity_check"
 
-    def is_supported(self, ctx) -> bool: ...
-    def plan(self, ctx) -> list[TestTask]: ...
-    def run(self, ctx, task: TestTask) -> TestResult: ...
-    def parse(self, ctx, artifacts) -> TestResult: ...
+required_tools: list[str] = []
+required_hal_caps: list[str] = [
+    "device_status",
+    "isi_presence",
+    "pcie_link_status",
+    "power_connection_status",
+]
+
+def run(context, devices: list[str], options: dict) -> list[dict]:
+    ...
 ```
 
 Runner context should provide:
 
 - `ctx.hal`
-- `ctx.devices`
-- `ctx.topology`
-- `ctx.policy`
-- `ctx.tools`
-- `ctx.scheduler`
-- `ctx.leases`
-- `ctx.monitor`
-- `ctx.results`
-- `ctx.logs`
+- `ctx.config`
+- `ctx.runner`
+- `ctx.lease(...)`
+- `ctx.run_atomic_test(...)`
+- `ctx.run_tool(...)`
+- `ctx.log_dir`
 
-Tool adapter contract:
+The first testcase package may use a simple registry in `tests/__init__.py`:
 
 ```python
-spec = ToolSpec(
-    name="fio",
-    argv=[...],
-    timeout_s=360,
-    env={},
-    cwd=None,
-    parser=FioJsonParser(),
-)
-result = ctx.tools.run(spec)
+TESTCASES = {
+    "connectivity_check": run_connectivity_check,
+    "nvme_fio": run_nvme_fio,
+}
 ```
 
-The adapter owns process group cleanup, stdout/stderr capture, timeout, structured parser execution, and artifact registration.
+Keep external tool execution in `Runner.run_tool(...)` for the MVP. It should own argv construction or validation, timeout, environment, cwd, stdout/stderr capture, process cleanup, log paths, parser callback execution, and artifact registration. Split it into `tool_adapter.py` only when several tool wrappers make `runner.py` hard to read.
 
 ## Policy Model
 
@@ -317,9 +305,28 @@ expected:
   accelerator: 8
   nvme: 16
   nic: 8
-mapping:
-  "0000:65:00.0": CHIP_0
-  "0000:66:00.0": CHIP_1
+logical_devices:
+  CHIP_0:
+    name: CHIP_0
+    type: ai_chip
+    slot: OAM0
+    locator:
+      pci_bdf: "0000:65:00.0"
+      devnode: "/dev/ai-chip0"
+    parents: [FABRIC_0, PCIE_DOMAIN_0, RESET_DOMAIN_0, POWER_DOMAIN_0]
+  CHIP_1:
+    name: CHIP_1
+    type: ai_chip
+    slot: OAM1
+    locator:
+      pci_bdf: "0000:66:00.0"
+      devnode: "/dev/ai-chip1"
+    parents: [FABRIC_0, PCIE_DOMAIN_0, RESET_DOMAIN_0, POWER_DOMAIN_0]
+  FABRIC_0:
+    name: FABRIC_0
+    type: fabric_domain
+    parents: []
+    locator: {}
 thresholds:
   chip_temp_c_max: 85
   hbm_ecc_uncorrectable_max: 0
@@ -356,7 +363,9 @@ locks:
       - BMC_0
 ```
 
-## Scheduler Model
+`logical_devices.<id>.name` is the canonical LogicalDevice ID. It should be stable across runs and should be the identifier used by CLI targets, testcase config, lease requests, HAL atomic calls, and result reports. `locator` pins that logical name to observed hardware such as BDF, devnode, sysfs path, serial, slot, or BMC path. HAL discovery should return observed hardware facts; the Python framework should match observed devices to policy locators before presenting canonical names.
+
+## Future Scheduler Model
 
 Represent tests as a DAG of tasks. Each task declares LogicalDevice locks. LogicalDevices include physical nodes such as chips, SSDs, NICs, and switches, plus virtual/domain nodes such as fabrics, PCIe domains, reset domains, power domains, thermal domains, BMC channels, and telemetry channels.
 
@@ -368,18 +377,17 @@ Examples:
 - `pcie_reset(CHIP_0)` locks `PCIE_DOMAIN_0`, `RESET_DOMAIN_0`, and `CHIP_0`.
 - BMC/IPMI/Redfish operations lock `BMC_0`.
 
-Keep the public orchestration abstraction named `Scheduler` so the framework can later grow queueing, worker pools, priority, fairness, and DAG dispatch. In the MVP, implement it as a synchronous lease-aware facade:
+Keep the public orchestration abstraction named `Scheduler` only if the framework later needs queueing, worker pools, priority, fairness, or DAG dispatch. In the MVP, keep this behavior as a synchronous lease gate in `runner.py`:
 
 ```text
 Runner
-  -> Scheduler.run_testcase(...)
-      -> PolicyEngine expands locks and lock groups
-      -> LeaseManager.try_acquire(...)
-      -> TestCase.run(...)
-      -> LeaseManager.release(...)
+  -> expand locks and lock groups
+  -> acquire lease
+  -> testcase run(context, devices, options)
+  -> release lease
 ```
 
-The MVP `Scheduler` should support only `shared` and `exclusive` modes, acquire locks in deterministic LogicalDevice ID order, reject or wait on conflicting locks, and record lease metadata in results. Its backing `LeaseManager` must be cross-process visible so multiple CLI instances can run concurrently when their LogicalDevice leases do not conflict. Do not use a global CLI lock for this model.
+The MVP lease gate should support only `shared` and `exclusive` modes, acquire locks in deterministic LogicalDevice ID order, reject or wait on conflicting locks, and record lease metadata in results. It must be cross-process visible so multiple CLI instances can run concurrently when their LogicalDevice leases do not conflict. Do not use a global CLI lock for this model.
 
 Add queueing, priority/fairness, worker pools, suite-level automatic parallelization, and a richer ResourceGraph only when the test suite needs them.
 
@@ -397,11 +405,11 @@ Every result should include:
 - Artifacts: logs, JSON, telemetry snapshots, command lines, core dumps.
 - Retry history.
 
-## DGX-Derived Lessons
+## Design Lessons
 
-- Keep a testcase base interface similar to DGX's `DCDiagTest`, but make planning and parsing explicit.
-- Keep DGX's useful separation of product/HAL/testcase, but move platform semantics into C++ HAL and policy files where possible.
-- Preserve multi-instance execution patterns for independent accelerator tests and FIO tests, but express concurrency through resource locks. DGX `gpustress` launches multiple MODS instances from Python, one per GPU; treat that as a legacy/tool-adapter pattern. For a cleaner HAL/UMD-based chip stack, prefer one coarse HAL primitive for strongly coupled multi-chip stress.
+- Preserve useful testcase contract ideas such as support checks, required tools, timeout, status, and artifacts, but keep the MVP testcase API as a plain module-level `run(context, devices, options)` function.
+- Keep platform semantics in C++ HAL and policy files where possible, not scattered through Python testcase code.
+- Preserve multi-instance execution patterns for independent accelerator tests and FIO tests, but express concurrency through resource locks. For a clean HAL/UMD-based chip stack, prefer one coarse HAL atomic test for strongly coupled multi-chip stress.
 - Preserve background monitoring for BMC/sensors/telemetry, but make it a first-class monitor service.
 - Avoid letting Python directly depend on low-level kernel details. Use HAL bindings.
 - Avoid log-only parsing when structured output is available.
