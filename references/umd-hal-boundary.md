@@ -23,7 +23,7 @@ kernel module
   -> ultra-thin privileged services: contiguous memory allocation/mmap and IRQ event delivery
 ```
 
-Do not expose UMD descriptor APIs directly to Python testcases. Python should call HAL operations such as `run_primitive("dma_loopback", "TPU_0", options)`.
+Do not expose UMD descriptor APIs directly to Python testcases. Python should call HAL operations such as `run_atomic_test("pcie_dma_data_transfer", "TPU_0", options)`.
 
 ## UMD Responsibilities
 
@@ -51,7 +51,7 @@ HAL owns diagnostic semantics:
 - Device discovery and logical naming.
 - Topology and domain mapping.
 - Telemetry readout and event normalization.
-- Stable primitive APIs such as `memory_selftest`, `dma_loopback`, `compute_smoke`, `pcie_link_check`, and `reset_check`.
+- Stable atomic APIs such as `memory_selftest`, `pcie_dma_data_transfer`, `compute_smoke`, `pcie_link_status_check`, and `reset_check`.
 - Conversion from UMD/FW errors into framework error domains.
 - Artifact creation for descriptor dumps, completion logs, telemetry snapshots, and FW traces.
 - A mockable boundary for Python bindings and fake HAL tests.
@@ -134,8 +134,8 @@ public:
 HAL should expose coarser APIs over this:
 
 ```cpp
-hal.run_primitive("dma_loopback", DeviceId{"TPU_0"}, options);
-hal.run_primitive("memory_selftest", DeviceId{"TPU_0"}, options);
+hal.run_atomic_test("pcie_dma_data_transfer", DeviceId{"TPU_0"}, options);
+hal.run_atomic_test("memory_selftest", DeviceId{"TPU_0"}, options);
 ```
 
 ## Open Design Checks

@@ -55,7 +55,7 @@ External Tools
 ```text
 main.py
   -> parse: aidiag discover
-  -> parse: aidiag atomic pcie_link_status --device TPU_0
+  -> parse: aidiag atomic pcie_link_status_check --device TPU_0
   -> parse: aidiag test connectivity_check --device TPU_0
   -> parse: aidiag run --config production.yaml
   -> call Runner.discover(...)
@@ -74,7 +74,7 @@ config.py
   -> return testcase options
   -> return thresholds
   -> return timeout
-  -> return LogicalDevice locks
+  -> return top-level device/resource locks
 ```
 
 `runner.py` is the reusable execution engine. It exists so CLI, MFG station, daemon, or REST service can all execute diagnostics without duplicating lease, result, report, and helper logic.
@@ -116,7 +116,7 @@ hal.get_devices_by_type(type: str) -> list[str]
 
 `discover()` returns observed components only. Do not include absent devices or `presence=false` entries. Missing devices are detected by the `skucheck` testcase by comparing expected topology/config against the discovered result.
 
-For MVP, `name` is the canonical LogicalDevice ID used by CLI targets, testcase config, lease requests, HAL atomic calls, and result reports. The platform policy should pin each stable `name` to real hardware using `locator` fields such as `pci_bdf`, `devnode`, `sysfs_path`, `serial`, `slot`, or BMC path. HAL discovery should return observed hardware facts. The Python framework should match observed devices against policy locators and resolve the canonical `name`; do not assign `TPU_0`, `TPU_1`, and similar names from raw discovery order.
+For MVP, `name` is the canonical top-level device ID used by CLI targets, testcase config, lease requests, HAL atomic calls, and result reports. The platform policy should pin each stable `name` to real hardware using `locator` fields such as `pci_bdf`, `devnode`, `sysfs_path`, `serial`, `slot`, or BMC path. HAL discovery should return observed hardware facts. The Python framework should match observed devices against policy locators and resolve the canonical `name`; do not assign `TPU_0`, `TPU_1`, and similar names from raw discovery order.
 
 Minimum discovery result:
 
@@ -151,14 +151,14 @@ Minimum discovery result:
 Field meaning:
 
 ```text
-name      -> canonical LogicalDevice ID and normal test target, for example TPU_0
+name      -> canonical top-level device ID and normal test target, for example TPU_0
 type      -> TPU, SSD, CPU, PCIE_SWITCH, BMC, etc.
 slot      -> simple human-facing location string; may be empty if unknown
 locator   -> machine-facing access info used to match policy to observed hardware, such as pci_bdf, devnode, sysfs path, serial, slot, or BMC path
 topology  -> parent/child edges used by CLI tree output and topology-aware tests
 ```
 
-Do not put firmware version, serial number, PCIe link status, health, or telemetry into `discover()`. Use `run_atomic_test("identify", device)` for identity details, `skucheck.py` for expected-vs-observed inventory/version checks, and `connectivity_check.py` for link/power/connection health.
+Do not put firmware version, serial number, PCIe link status, health, or telemetry into `discover()`. Use HAL atomic tests such as `identify`, `read_fru`, and `error_counter_snapshot` for hardware facts. Python `skucheck.py` compares expected-vs-observed inventory/version policy, and `connectivity_check.py` checks link/power/connection criteria.
 
 ## HAL Atomic Test Interface
 
@@ -179,22 +179,35 @@ Examples:
 
 ```python
 hal.run_atomic_test("identify", "TPU_0")
-hal.run_atomic_test("isi_presence", "TPU_0")
-hal.run_atomic_test("pcie_link_status", "TPU_0")
-hal.run_atomic_test("power_connection_status", "TPU_0")
+hal.run_atomic_test("isi_link_up", "TPU_0", args={"links": "all"})
+hal.run_atomic_test("pcie_link_status_check", "TPU_0", args={"depth": "all"})
+hal.run_atomic_test("power_sanity", "TPU_0", args={"workload": "short"})
 hal.run_atomic_test("memory_selftest", "TPU_0", args={"pattern": "walking_ones"})
-hal.run_atomic_test("dma_loopback", "TPU_0", args={"bytes": 1048576})
+hal.run_atomic_test("pcie_dma_data_transfer", "TPU_0", args={"direction": "both", "bytes": 1048576})
 ```
 
 HAL owns the hardware facts and low-level semantics. Python must not directly access registers, firmware descriptors, BAR/MMIO, UMD queue APIs, or kernel ioctls.
 
 For MVP, keep one `device` per atomic test call. If a future HAL operation truly requires synchronized multi-device execution, add a separate group API later, such as `hal.run_group_atomic_test(...)`, instead of complicating the first `run_atomic_test(...)` contract.
 
+Reserve the group atomic test shape for later:
+
+```python
+hal.run_group_atomic_test(
+    test_name: str,
+    devices: list[str],
+    args: dict | None = None,
+    timeout_s: int | None = None,
+) -> dict
+```
+
+Python decides the target device list from CLI/config/policy, acquires leases covering every target and affected shared domain, and passes the list to HAL. HAL does not choose which devices to stress. It validates the given devices and runs the atomic test concurrently over exactly that set. This is intended for strongly synchronized diagnostics such as multi-TPU stress, fabric stress, collective bandwidth, thermal stress, or synchronized power stress, where HAL/UMD should own internal workers, start barriers, fail policy, timeout, cancel, drain, and cleanup. Do not implement this for the MVP unless a real synchronized multi-device test requires it.
+
 Atomic test result should be structured:
 
 ```python
 {
-    "name": "pcie_link_status",
+    "name": "pcie_link_status_check",
     "device": "TPU_0",
     "status": "pass",
     "metrics": {
@@ -254,9 +267,9 @@ runner.py
 
 tests/connectivity_check.py
   -> with context.lease(["TPU_0", "PCIE_DOMAIN_0", "POWER_DOMAIN_0"], shared=True)
-  -> context.hal.run_atomic_test("isi_presence", "TPU_0")
-  -> context.hal.run_atomic_test("pcie_link_status", "TPU_0")
-  -> context.hal.run_atomic_test("power_connection_status", "TPU_0")
+  -> context.hal.run_atomic_test("isi_link_up", "TPU_0", {"links": "all"})
+  -> context.hal.run_atomic_test("pcie_link_status_check", "TPU_0", {"depth": "all"})
+  -> context.hal.run_atomic_test("power_sanity", "TPU_0", {"workload": "short"})
   -> compare metrics against config thresholds
   -> return one connectivity_check result
 ```
@@ -414,7 +427,7 @@ This gives bring-up engineers a direct low-level path for quick checks while pre
 
 For MVP, testcase code may choose what to lease, but it must use the runner/context lease helper. Do not reimplement lease mechanics inside each testcase.
 
-The MVP `LeaseManager` must provide cross-process protection so multiple CLI instances, MFG station workers, or daemon entrypoints cannot accidentally touch conflicting LogicalDevices at the same time. Keep the implementation small: shared/exclusive locks over expanded LogicalDevice IDs, deterministic acquisition order, owner metadata, timeout behavior, and best-effort stale lease cleanup are enough. Do not add queueing, priority, fairness, worker pools, or DAG scheduling for the MVP.
+The MVP `LeaseManager` must provide cross-process protection so multiple CLI instances, MFG station workers, or daemon entrypoints cannot accidentally touch conflicting top-level devices or shared domains at the same time. Keep the implementation small: shared/exclusive locks over expanded device/resource IDs, deterministic acquisition order, owner metadata, timeout behavior, and best-effort stale lease cleanup are enough. Do not add queueing, priority, fairness, worker pools, or DAG scheduling for the MVP.
 
 The cross-process lease helper may live inside `runner.py` initially. Split it into `lease_manager.py` only when heartbeats, stale cleanup, wait policy, persistence, or concurrent execution make `runner.py` hard to read.
 
@@ -422,9 +435,9 @@ Recommended pattern:
 
 ```python
 with context.lease(shared=["TPU_0", "PCIE_DOMAIN_0", "POWER_DOMAIN_0"], owner=name):
-    isi = context.run_atomic_test("isi_presence", "TPU_0")
-    pcie = context.run_atomic_test("pcie_link_status", "TPU_0")
-    power = context.run_atomic_test("power_connection_status", "TPU_0")
+    isi = context.run_atomic_test("isi_link_up", "TPU_0", {"links": "all"})
+    pcie = context.run_atomic_test("pcie_link_status_check", "TPU_0", {"depth": "all"})
+    power = context.run_atomic_test("power_sanity", "TPU_0", {"workload": "short"})
 ```
 
 ## Result and Report Guidance
@@ -455,9 +468,9 @@ artifacts
     "status": "fail",
     "diagnosis": "PCIe width mismatch",
     "subresults": [
-        {"name": "isi_presence", "status": "pass"},
-        {"name": "pcie_link_status", "status": "fail", "metrics": {"width": 8}},
-        {"name": "power_connection_status", "status": "pass"}
+        {"name": "isi_link_up", "status": "pass"},
+        {"name": "pcie_link_status_check", "status": "fail", "metrics": {"width": 8}},
+        {"name": "power_sanity", "status": "pass"}
     ]
 }
 ```

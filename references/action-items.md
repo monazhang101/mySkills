@@ -16,9 +16,9 @@ Goal: make the user-facing test config precise enough that CLI, MFG station, and
 
 Decisions to record:
 
-- Required top-level fields: `sequence`, `tests`, `logical_devices`, optional `platform`, `defaults`, `report`.
-- LogicalDevice entry shape: `name`, `type`, `parents`, `locator`, optional `slot`; `name` is the canonical LogicalDevice ID used by CLI targets, testcase config, leases, HAL atomic calls, and result reports.
-- Locator match keys and precedence, for example `pci_bdf`, `devnode`, `sysfs_path`, `serial`, `slot`, or BMC path; HAL discovery returns observed hardware facts, and the Python framework matches observed hardware to policy locators before presenting canonical LogicalDevice names.
+- Required top-level fields: `sequence`, `tests`, `devices`, optional `platform`, `defaults`, `report`.
+- Device entry shape: `name`, `type`, `parents`, `locator`, optional `slot`; `name` is the canonical top-level target ID used by CLI targets, testcase config, leases, HAL atomic calls, and result reports.
+- Locator match keys and precedence, for example `pci_bdf`, `devnode`, `sysfs_path`, `serial`, `slot`, or BMC path; HAL discovery returns observed hardware facts, and the Python framework matches observed hardware to policy locators before presenting canonical device names.
 - Sequence entry shape: `name`, `devices`, `options`, `timeout_s`, `continue_on_fail`, `tags`.
 - Per-test config shape: `options`, `thresholds`, `locks`, `timeout_s`, `retry`.
 - How device templates are expanded, for example `${device}`.
@@ -36,21 +36,29 @@ examples/production_sequence.yaml
 
 Goal: agree on the first set of HAL atomic tests that Python testcases can compose.
 
+Decision: first implementation focuses on single-device `run_atomic_test(...)`. Reserve `run_group_atomic_test(...)` as a future extension for strongly synchronized multi-device diagnostics. Python will choose and lease the target device list; HAL will validate and execute concurrently over exactly the devices provided.
+
 Initial candidates:
 
-- `device_status`
-- `isi_presence`
-- `pcie_link_status`
-- `power_connection_status`
+- `identify`
+- `read_fru`
+- `bar_probe`
+- `register_block_probe`
+- `pcie_link_status_check`
+- `isi_link_up`
+- `power_sanity`
 - `topology_snapshot`
 - `telemetry_snapshot`
+- `memory_get_inventory`
 - `memory_selftest`
-- `dma_loopback`
+- `error_counter_snapshot`
+- `pcie_dma_data_transfer`
 
 For each atomic test, record:
 
 - Name and purpose.
-- Required target type, such as `TPU`, `PCIE_DOMAIN`, `POWER_DOMAIN`.
+- Whether it is single-device only or may later support group execution.
+- Required target type, usually top-level `TPU` for TPU atomic tests. Use `PCIE_DOMAIN`, `POWER_DOMAIN`, or other domain targets only when the domain must be independently selected or locked.
 - Input options.
 - Output fields and metrics.
 - Error codes and failure meanings.
@@ -107,7 +115,7 @@ Goal: make the first real testcase the reference style for all future Python tes
 
 The testcase should demonstrate:
 
-- Gate check with `device_status`.
+- Gate check with `identify` or another cheap status/identity atomic test.
 - Lease use through `ctx.lease(...)`.
 - Composing multiple HAL atomic tests.
 - Threshold comparison from config.
@@ -117,10 +125,10 @@ The testcase should demonstrate:
 Expected atomic calls:
 
 ```python
-ctx.run_atomic_test("device_status", device=device)
-ctx.run_atomic_test("isi_presence", device=device)
-ctx.run_atomic_test("pcie_link_status", device=device)
-ctx.run_atomic_test("power_connection_status", device=device)
+ctx.run_atomic_test("identify", device=device)
+ctx.run_atomic_test("isi_link_up", device=device, args={"links": "all"})
+ctx.run_atomic_test("pcie_link_status_check", device=device, args={"depth": "all"})
+ctx.run_atomic_test("power_sanity", device=device, args={"workload": "short"})
 ```
 
 Expected output:

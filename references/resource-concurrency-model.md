@@ -50,6 +50,10 @@ Defer queueing, priority/fairness, worker pools, DAG dispatch, and automatic sui
 
 Move submit/wait/cancel/drain into the kernel only as a future heavy-kmod mode when user-space UMD/HAL ownership cannot provide enough crash safety, interrupt ownership, multi-process arbitration, or reset safety.
 
+## TPU MVP Override
+
+For the current TPU MVP, do not expose PCIe, ISI, PMU, DDP, memory-controller, or similar TPU-internal blocks as logical tree nodes by default. Python-visible targets are top-level devices such as `TPU_0`, `TPU_1`, SSDs, NICs, and BMC/system devices. Add separate fabric, PCIe, power, reset, or telemetry resources only when tests truly need independent selection or shared-resource locking.
+
 ## LogicalDevice-First Model
 
 Expose everything the user can select, inspect, or lock as a LogicalDevice. A LogicalDevice may be physical, virtual, or a domain.
