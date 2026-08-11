@@ -45,20 +45,20 @@ Initial candidates:
 - `bar_probe`
 - `register_block_probe`
 - `pcie_link_status_check`
-- `isi_link_up`
+- `isi_linkup`
 - `power_sanity`
 - `topology_snapshot`
 - `telemetry_snapshot`
-- `memory_get_inventory`
-- `memory_selftest`
 - `error_counter_snapshot`
 - `pcie_dma_data_transfer`
+- PMU module examples: `pmu_reg_read`, `pmu_reg_write`, `pmu_reg_expect`
+- DDP module examples: `ddp_dvsec_verify`, `ddp_dmem_linkup_verify`, `ddp_dmem_perf`
 
 For each atomic test, record:
 
 - Name and purpose.
 - Whether it is single-device only or may later support group execution.
-- Required target type, usually top-level `TPU` for TPU atomic tests. Use `PCIE_DOMAIN`, `POWER_DOMAIN`, or other domain targets only when the domain must be independently selected or locked.
+- Required target type: `TPU` for parent-owned PCIe/DMA/SoC tests, `PMU` for PMU tests, `ISI` for ISI tests, and `DDP` for DDP tests.
 - Input options.
 - Output fields and metrics.
 - Error codes and failure meanings.
@@ -125,10 +125,10 @@ The testcase should demonstrate:
 Expected atomic calls:
 
 ```python
-ctx.run_atomic_test("identify", device=device)
-ctx.run_atomic_test("isi_link_up", device=device, args={"links": "all"})
-ctx.run_atomic_test("pcie_link_status_check", device=device, args={"depth": "all"})
-ctx.run_atomic_test("power_sanity", device=device, args={"workload": "short"})
+ctx.run_atomic_test(device, "identify", {})
+ctx.run_atomic_test("ISI_0_0", "isi_linkup", {})
+ctx.run_atomic_test(device, "pcie_link_status_check", {"depth": "all"})
+ctx.run_atomic_test(device, "power_sanity", {"workload": "short"})
 ```
 
 Expected output:

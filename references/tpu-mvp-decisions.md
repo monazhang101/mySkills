@@ -22,12 +22,30 @@ Do not put diagnostic semantics, SKU policy, topology interpretation, register d
 
 ## Device Model
 
-Use top-level devices as Python-visible targets:
+Use stable HAL target names as Python/CLI-visible targets:
 
 - `TPU_0`, `TPU_1`, and later `SSD_0`, `NIC_0`, `BMC_0`, etc.
-- For TPU tests, Python targets the TPU device, not internal blocks.
-- PCIe, ISI, PMU, DDP, memory controller, and similar blocks are private `TPUDevice` modules/capabilities.
-- Do not expose internal TPU blocks in the logical tree unless they need independent target selection, locking, reset, firmware update, lifecycle ownership, or report identity.
+- For the current TPU MVP, `TPUDevice` owns child module target objects for PMU, ISI, and DDP.
+- Canonical child target names follow the parent TPU index: `PMU_0`, `ISI_0_0`, `ISI_0_1`, `DDP_0`, then `PMU_1`, `ISI_1_0`, `ISI_1_1`, `DDP_1`.
+- PCIe/DMA and SoC atomic tests stay registered on the parent TPU target.
+- PMU, ISI, and DDP atomic tests are registered on their own module target objects.
+- Generic helpers such as register read/write, MMIO read/write, pattern generation, and data compare are pure utility APIs, not target devices and not atomic tests.
+- Ignore UART, OpenOCD, and XDE helper placement for now.
+
+`DeviceContext` is the physical PCI device context:
+
+- Keep `DeviceContext` generic: `bdf`, `vendor_id`, `device_id`, `mapped_bar_base`, and `bar_size`.
+- Do not put module register windows such as PMU/ISI/DDP `reg_base`, `reg_offset`, or `reg_size` into `DeviceContext`.
+- `DeviceContext` is filled during `DeviceManager.discover()` after PCI scan, policy match, and BAR mmap.
+
+Register-window ownership:
+
+- Register windows belong to the device/module object that uses them.
+- `TPUDevice` may hold parent-owned windows such as `pcie_reg_base_`, `pcie_reg_size_`, `soc_reg_base_`, and `soc_reg_size_`.
+- `PMUModule`, `ISIModule`, and `DDPModule` hold their own `reg_base_`, `reg_offset_`, and `reg_size_`.
+- Keep `reg_size_` with `reg_base_` so `common::reg::read/write` can perform range checks.
+- Do not add `memory_reg_base_` or memory-controller register attributes until real MC register atomic tests are identified.
+- Treat device-memory or DMEM windows separately from register windows; use names such as `dev_mem_base` or `dmem_window_base` only when a real data window exists.
 
 `DeviceManager.discover()` should:
 
@@ -35,8 +53,17 @@ Use top-level devices as Python-visible targets:
 - Filter supported TPU VID/DID/revision values.
 - Apply platform policy to map BDF/slot/serial to canonical names such as `TPU_0`.
 - mmap required BAR spaces.
-- Construct `TPUDevice` objects with internal block helpers.
-- Return a device tree containing top-level target devices and relevant system topology, not every internal register block.
+- Construct `TPUDevice` objects and let each TPU construct its PMU/ISI/DDP module targets.
+- Register every runnable target in one target registry.
+- Return a device tree containing TPU targets plus PMU/ISI/DDP module targets.
+- Be called explicitly by CLI/Python before atomic tests run; discovery is not a background side effect.
+
+Common utility boundary:
+
+- `common::args` parses `TestArgs`.
+- `common::reg` operates on register windows and uses `reg_base + reg_offset + reg_size`.
+- `common::devmem` operates on device-memory/DMEM byte ranges, not control/status registers.
+- `common::pattern` only generates and compares simple payload patterns; current formats are `zero`, `random`, and `incremental`.
 
 ## HAL Atomic Tests
 
@@ -49,19 +76,33 @@ Good atomic test names:
 - `bar_probe`
 - `register_block_probe`
 - `pcie_link_status_check`
-- `isi_link_up`
-- `pmu_read_sensor`
-- `memory_get_inventory`
+- `isi_linkup`
+- `pmu_reg_read`
 - `error_counter_snapshot`
 - `pcie_dma_data_transfer`
+
+Use `snake_case` for external atomic test names because those names appear in CLI, config, Python calls, logs, and reports. Keep C++ implementation functions in normal C++ style, for example `PcieDmaDataTransfer`. The registration line connects the two names:
+
+```cpp
+_add_test("pcie_dma_data_transfer",
+          [this](const TestArgs& args) { return PcieDmaDataTransfer(args); });
+```
+
+Keep headers declaration-only. Put one `_add_test(...)` line per atomic test directly inside the device/module constructor body so the constructor reads like that target's test catalog. Put atomic test steps directly in the matching implementation file: `TPUDevice.cpp` for TPU/PCIe/DMA/SoC tests, `PMUModule.cpp` for PMU tests, `ISIModule.cpp` for ISI tests, and `DDPModule.cpp` for DDP tests. Do not create separate `*TestCases.cpp` files for the current pseudocode layout.
 
 Merge equivalent operations into one atomic test and express variants as arguments:
 
 ```python
-hal.run_atomic_test("pcie_dma_data_transfer", "TPU_0", {"direction": "h2d"})
-hal.run_atomic_test("pcie_dma_data_transfer", "TPU_0", {"direction": "d2h"})
-hal.run_atomic_test("pcie_dma_data_transfer", "TPU_0", {"direction": "both"})
-hal.run_atomic_test("isi_link_up", "TPU_0", {"links": "all"})
+hal.run_atomic_test("TPU_0", "pcie_dma_data_transfer", {"direction": "h2d"})
+hal.run_atomic_test("TPU_0", "pcie_dma_data_transfer", {"direction": "d2h"})
+hal.run_atomic_test("TPU_0", "pcie_dma_data_transfer", {"direction": "both"})
+hal.run_atomic_test("ISI_0_0", "isi_linkup", {})
+```
+
+For a CLI-first MVP, prefer a generic one-shot shape before adding per-test custom parsers:
+
+```bash
+aidiag atomic --device TPU_0 --test pcie_dma_data_transfer --arg direction=h2d --arg size_bytes=4096
 ```
 
 HAL returns observed facts and metrics. Python applies policy, thresholds, and pass/fail criteria.
@@ -73,6 +114,6 @@ Python composes atomic tests into user-facing testcases:
 - `skucheck`: supported-system and TPU basic configuration/version/inventory check, aligned with DGX-style expected-vs-observed policy comparison.
 - `connectivity`: link and power-path sanity checks, including ISI physical presence, PCIe speed/width at required topology depths, and short power workload sustain checks.
 
-`skucheck` should call atomic tests such as `identify`, `read_fru`, `bar_probe`, `register_block_probe`, `memory_get_inventory`, and `error_counter_snapshot`, then compare results with SKU policy.
+`skucheck` should call atomic tests such as `identify`, `read_fru`, `bar_probe`, `register_block_probe`, and `error_counter_snapshot`, then compare results with SKU policy.
 
-`connectivity` should call atomic tests such as `pcie_link_status_check`, `isi_link_up`, and short `power_sanity` or workload probes, then compare with connectivity criteria.
+`connectivity` should call atomic tests such as `pcie_link_status_check`, `isi_linkup`, and short `power_sanity` or workload probes, then compare with connectivity criteria.
