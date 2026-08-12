@@ -16,11 +16,13 @@ Use this skill to design or evolve a clean AI chip diagnostic framework. Keep th
 - Keep Python as orchestration: scheduling, policy loading, external tool execution, report generation, retry, timeout, and workflow composition.
 - Use platform policy files for SKU/topology/threshold/concurrency differences instead of scattering platform conditionals through tests.
 - Prefer a TPU-target-first MVP for accelerator diagnostics: expose stable target devices such as `TPU_0`, `TPU_1`, SSDs, NICs, and BMC/system devices. For the current TPU MVP, PMU, ISI, and DDP are also runnable module targets owned by `TPUDevice`; PCIe/DMA and SoC tests remain on the parent TPU target.
-- Treat the top-level device name as the canonical test target. Policy files should pin stable names such as `TPU_0` or `TPU_1` to real hardware using locator fields such as `pci_bdf`, `devnode`, `sysfs_path`, `serial`, `slot`, or BMC path. HAL discovery should return observed top-level devices and topology facts; CLI targets, testcase config, leases, HAL calls, and result reports should use the canonical name, not raw BDFs.
-- Model resource occupancy explicitly, but keep the MVP simple: most per-TPU tests lock the top-level TPU device. Add separate domain resources such as fabric, PCIe domain, reset domain, power domain, or telemetry domain only when tests truly share or contend for them.
-- Treat concurrent submit paths as first-class resources: tests should acquire device/resource leases before touching hardware, while UMD/HAL owns descriptor allocation, ring updates, doorbells, polling, completion attribution, cancel, and drain.
-- For strongly coupled multi-device diagnostics such as 8-chip stress, fabric stress, collective bandwidth, thermal stress, or synchronized power stress, Python should acquire the full top-level device and shared-domain lease set and call one coarse HAL atomic test. HAL/UMD should own internal multi-device workers, start barriers, submit/completion attribution, timeout, cancel, drain, and cleanup. Python fan-out is acceptable for independent per-device tests and external tool adapters.
-- For the first Python MVP, prefer a compact config-driven runner instead of a fully decomposed framework. A reasonable MVP is `main.py`, `config.py`, `runner.py`, and a `tests/` testcase package: entrypoint, test config parser, sequential runner/report writer, cross-process lease helper, `Runner.run_tool(...)`, and thin testcase modules. Python testcases such as `skucheck` and `connectivity` compose HAL atomic tests and compare results with policy/criteria; they are not HAL atomic test names. Split out `scheduler.py`, `lease_manager.py`, `tool_adapter.py`, `result_store.py`, or richer testcase framework files only when complexity proves it is needed.
+- Treat the top-level device name as the canonical test target. Policy files should pin stable names such as `TPU_0` or `TPU_1` to real hardware using locator fields such as `pci_bdf`, `devnode`, `sysfs_path`, `serial`, `slot`, or BMC path. HAL discovery should return observed top-level devices and topology facts; CLI targets, testcase config, HAL calls, and result reports should use the canonical name, not raw BDFs.
+- MVP concurrency decision: do not require Python/testcase code to acquire explicit device/resource leases. Use object mutexes plus HQC ringbuffer management first, and enhance only when concrete concurrency bugs appear.
+- Treat HQC command submission as the primary concurrency boundary when internal tests are implemented by sending HQC commands. A shared `HqcCommandQueue` or UMD queue manager owns descriptor allocation, ring head/tail updates, doorbells, completion attribution, timeout, cancel, and drain.
+- Use object-level mutexes to keep tests on the same `TPUDevice`, `PMUModule`, `ISIModule`, or `DDPModule` object sequential. If two module objects share one HQC path, they may submit concurrently only through the shared queue manager; add a parent TPU or shared-executor mutex only for non-HQC paths or multi-command sequences that must not interleave.
+- TODO: review every non-HQC path before enabling broad parallel execution. Direct BAR/MMIO register access, PMU mailboxes, VFIO interrupt setup, reset/link retrain, device-memory allocation/free, and multi-command stateful sequences may need HAL-internal serialization or quiesce/drain sequencing.
+- For strongly coupled multi-device diagnostics such as 8-chip stress, fabric stress, collective bandwidth, thermal stress, or synchronized power stress, Python should call one coarse HAL atomic test. HAL/UMD should own internal multi-device workers, start barriers, submit/completion attribution, timeout, cancel, drain, and cleanup. Python fan-out is acceptable for independent per-device tests and external tool adapters.
+- For the first Python MVP, prefer a compact config-driven runner instead of a fully decomposed framework. A reasonable MVP is `main.py`, `config.py`, `runner.py`, and a `tests/` testcase package: entrypoint, test config parser, sequential runner/report writer, `Runner.run_tool(...)`, and thin testcase modules. Python testcases such as `skucheck` and `connectivity` compose HAL atomic tests and compare results with policy/criteria; they are not HAL atomic test names. Split out `tool_adapter.py`, `result_store.py`, or richer testcase framework files only when complexity proves it is needed.
 - Prefer structured APIs and structured outputs: JSON/YAML/protobuf/result objects over ad hoc log scraping where tools allow it.
 - Make every layer mockable: provide fake HAL and dry-run tool adapters early.
 
@@ -46,12 +48,12 @@ C++ HAL
   -> pybind11/C ABI/gRPC bindings as needed
 
 Python framework
-  -> later target: CLI, testcase registry, top-level device registry, lease-aware Scheduler facade, enhanced cross-process LeaseManager, process manager
+  -> later target: CLI, testcase registry, top-level device registry, process manager
   -> complete target: policy engine, external tool adapters, monitor service, result store
-  -> Python MVP: main.py entrypoint, config.py parser, runner.py cross-process lease + run_tool + sequential execution + reports, tests/ thin testcase modules
+  -> Python MVP: main.py entrypoint, config.py parser, runner.py run_tool + sequential execution + reports, tests/ thin testcase modules
 
 Specs and policies
-  -> run specs, platform policies, thresholds, expected inventory, resource locks, concurrency rules
+  -> run specs, platform policies, thresholds, expected inventory, concurrency hints when needed
 
 Packaging and release
   -> build HAL/Python/kernel artifacts, install runtime layout, DKMS/no-kmod modes, deb packaging
@@ -64,19 +66,19 @@ Packaging and release
 - HAL low-level access: if no separate UMD exists, keep BAR/MMIO access, PCI config space access, DMA descriptor programming, doorbell writes, and polling completion in C++ HAL when user-space access is safe through VFIO, sysfs, vendor SDK, or a controlled mapping. If UMD exists, HAL should call UMD and keep descriptor/register details out of HAL's public Python-facing API.
 - HAL API to Python: expose operations such as `discover()`, `get_topology()`, `read_telemetry(device)`, `run_atomic_test(target_name, test_name, args)`, `run_group_atomic_test(test_name, devices, args)` when needed, `reset_device(device, mode)`, and `subscribe_events(device)`. HAL atomic tests are registered on the target device, so do not prefix test names with the device type. Prefer hardware-fact or primitive-operation names such as `identify`, `read_fru`, `bar_probe`, `register_block_probe`, `pcie_link_status_check`, `isi_linkup`, `pmu_reg_read`, `error_counter_snapshot`, or `pcie_dma_data_transfer`. Do not expose suite names such as `skucheck` as HAL atomic tests.
 - HAL submit API: expose session-scoped `submit_job()`, `wait_job()`, `cancel_job()`, and `drain_queue()` operations when tests program hardware work queues. HAL can implement these directly or delegate to UMD. Attach `test_id`, `session_id`, `device_id`, `queue_id`, descriptor identity, timeout, and artifact paths to every job.
-- HAL multi-device atomic API: expose coarse multi-device operations for tightly synchronized diagnostics, for example `run_group_atomic_test("tpustress", devices=[...], args={...})`. The active lease token must cover every affected chip and shared domain. Keep per-device workers, start barriers, queue submit mechanics, fail-fast policy, timeout, cancel, drain, and cleanup inside HAL/UMD for these tests.
+- HAL multi-device atomic API: expose coarse multi-device operations for tightly synchronized diagnostics, for example `run_group_atomic_test("tpustress", devices=[...], args={...})`. Keep per-device workers, start barriers, queue submit mechanics, fail-fast policy, timeout, cancel, drain, and cleanup inside HAL/UMD for these tests.
 - Python to external tools: for the MVP, keep this in `Runner.run_tool(...)`; it owns argv construction, timeout, environment, log paths, process cleanup, and parsers. Split to a `ToolAdapter` abstraction later when external tool wrappers become repetitive.
-- Policy to runner: for the default MVP, express locks as top-level target device IDs with `shared` or `exclusive` modes, for example `TPU_0`, `TPU_1`, `SSD_0`, `NIC_0`, or `BMC_0`. Add domain locks such as `FABRIC_0`, `PCIE_DOMAIN_0`, `RESET_DOMAIN_0`, `POWER_DOMAIN_0`, or `TELEMETRY_0` only when a testcase genuinely touches shared resources.
-- Runner to HAL: acquire top-level device/resource leases before submit; reject or wait on conflicting tests before they reach BAR/MMIO, reset, DMA engine, ringbuffer, or descriptor operations. For MVP, `runner.py` expands locks, uses a simple cross-process lease gate, wraps testcase execution, releases leases, and records lease metadata. Keep ring and descriptor arbitration in UMD/HAL, and keep the default kernel module outside this path except for the thinnest required memory/IRQ services.
+- Policy to runner: for the default MVP, keep policy focused on platform mapping, expected inventory, thresholds, and testcase options. Do not require user-facing resource lock declarations.
+- Runner to HAL: call HAL atomic tests directly. Keep object mutexes, HQC ring/descriptor arbitration, completion attribution, timeout, cancel, drain, and reset coordination inside HAL/UMD. Keep the default kernel module outside this path except for the thinnest required memory/IRQ services.
 - Packaging to runtime: install CLI, HAL shared library, Python package, policies, specs, schemas, tools, udev/systemd/logrotate files, and optional DKMS kernel module in predictable filesystem locations.
 
 ## Design Workflow
 
 1. Identify target devices: accelerators, HBM, switches, PCIe links, NVMe, NIC/IB, CPU, DIMM, fans, PSU, BMC/HMC, sensors.
 2. Define top-level target devices and topology: map physical devices such as `TPU_0`, `TPU_1`, `SSD_0`, `NIC_1`, or `BMC_0` to stable canonical `name` values; use `locator` fields to pin each physical device to BDF/devnode/sysfs/serial/slot/BMC access paths. Keep TPU-internal blocks such as PCIe, ISI, PMU, and DDP inside `TPUDevice` unless they need independent target/lock/lifecycle semantics.
-3. Define lightweight lock semantics: each testcase declares `shared` and `exclusive` locks over top-level devices and required shared domains; use lock groups for repeated sets such as all chips under one fabric. Implement a simple cross-process lease gate in `runner.py` so multiple CLI instances may run concurrently when leases do not conflict. Add a formal `LeaseManager`, `Scheduler`, or full resource graph only when lock expansion becomes too repetitive or imprecise.
+3. Define internal MVP concurrency semantics: same-object atomic tests are serialized by object mutexes; HQC-backed commands share one queue manager that serializes ring mutation and descriptor ownership; non-HQC paths are tracked as TODO review items and get HAL-side serialization only when a real test needs it.
 4. Define schemas and result model before writing tests.
-5. Build a minimal Python runner with fake HAL using the compact MVP layout when appropriate: `main.py`, `config.py`, `runner.py`, and `tests/`. Validate inventory, config, lease expansion, one HAL atomic testcase, one external-tool testcase, logs, and result JSON.
+5. Build a minimal Python runner with fake HAL using the compact MVP layout when appropriate: `main.py`, `config.py`, `runner.py`, and `tests/`. Validate inventory, config, one HAL atomic testcase, one external-tool testcase, logs, and result JSON.
 6. Add external tool tests first when useful, especially FIO/NVMe, because they validate orchestration without custom kernel work.
 7. Add C++ HAL discovery and telemetry next.
 8. Add UMD or HAL submit queue manager when tests program hardware queues. Centralize descriptor allocation, ring tail/head updates, doorbells, completion attribution, timeout, cancel, drain, reset coordination, and process-crash cleanup.
@@ -86,12 +88,13 @@ Packaging and release
 
 ## MVP And Future Ideas
 
-- MVP: schemas for top-level `Device`, `Topology`, `Policy`, `TestSpec`, and `TestResult`; compact Python runner with fake HAL, DeviceManager-backed discovery, policy locator matching, config-driven sequence execution, `tests/` testcase modules, simple cross-process lease helper, `Runner.run_tool(...)`, dry-run mode, and structured report.
+- MVP: schemas for top-level `Device`, `Topology`, `Policy`, `TestSpec`, and `TestResult`; compact Python runner with fake HAL, DeviceManager-backed discovery, policy locator matching, config-driven sequence execution, `tests/` testcase modules, `Runner.run_tool(...)`, dry-run mode, and structured report.
 - Future idea: real `nvme_fio` testcase via `Runner.run_tool(...)`; split out `ToolAdapter` later only when external tool wrappers become repetitive.
 - Current HAL direction: implement C++ `DeviceManager.discover()` first. It scans PCI devices, applies policy to map BDF/slot/serial to canonical TPU names, mmaps BAR space, creates `TPUDevice` instances, and exposes a Python binding. Then expose a small `run_atomic_test(...)` catalog. Reserve `run_group_atomic_test(...)` for synchronized multi-device diagnostics when needed.
 - Future idea: ultra-thin kernel module or VFIO/existing-driver path for contiguous memory allocation/mmap and optional IRQ event delivery. Preserve `device_addr`/`addr_kind` even if IOMMU is disabled for the MVP.
-- Future idea: enhance the lease implementation or split a formal `Scheduler` / `LeaseManager` facade out of `runner.py` if queueing, priority, heartbeats, stale cleanup, or richer concurrency requires it.
+- Future idea: add a HAL-side scheduler or supervised HAL daemon only if queueing, priority, crash recovery, multi-process arbitration, or richer concurrency requires it.
 - Future idea: UMD/HAL submit queue manager for hardware queue tests: session ownership, descriptor allocator, ringbuffer arbitration, doorbell, completion attribution, drain/cancel/reset, and cleanup.
+- Future idea: review and classify non-HQC paths once real tests exist; add narrow HAL-internal mutexes, parent-device sequencing, or quiesce/drain/reset guards only for paths proven to be unsafe.
 - Future idea: deb packaging with no-kmod and DKMS-kmod modes, runtime layout, udev, and install smoke test.
 - Future idea: chip memory, DMA, PCIe, thermal, reset, burn-in, multi-device, and multi-node suites.
 
@@ -101,9 +104,9 @@ Read `references/tpu-mvp-decisions.md` when the user asks about the current TPU 
 
 Read `references/python-framework-mvp.md` when the user asks to simplify the Python layer, design the MVP Python framework, decide whether CLI entry logic and runner logic should be merged, place testcase wrappers, define HAL `run_atomic_test` vs Python `run_tool`, or design CLI/testcase/sequence execution.
 
-Read `references/action-items.md` when the user asks what design or implementation details remain to be finalized, wants to track follow-up tasks across Python framework, HAL, UMD, kernel, packaging, or needs to revisit config schema, HAL atomic test catalog, result/error model, lease semantics, or the first connectivity testcase template.
+Read `references/action-items.md` when the user asks what design or implementation details remain to be finalized, wants to track follow-up tasks across Python framework, HAL, UMD, kernel, packaging, or needs to revisit config schema, HAL atomic test catalog, result/error model, concurrency semantics, or the first connectivity testcase template.
 
-Read `references/resource-concurrency-model.md` when the user asks about device/resource leases, device occupancy, concurrent tests, resource conflicts, shared physical resources, submit queues, ringbuffers, descriptors, scheduler policy, or concurrency models. Apply the TPU MVP override from `references/tpu-mvp-decisions.md`: internal TPU blocks are not logical tree nodes by default.
+Read `references/resource-concurrency-model.md` only when the user explicitly asks to revisit the older explicit lease/resource-policy approach. For current TPU MVP concurrency questions, prefer the SKILL.md conclusion: object mutexes plus a shared HQC command queue manager; no Python-visible LeaseManager by default.
 
 Read `references/thin-kmod-boundary.md` when the user asks whether the kernel module can be smaller, what belongs in ko vs HAL, or how DMA, IOMMU, BAR/MMIO, and PCI config space should be split.
 
