@@ -24,11 +24,12 @@ Do not put diagnostic semantics, SKU policy, topology interpretation, register d
 
 Use stable HAL target names as Python/CLI-visible targets:
 
-- `TPU_0`, `TPU_1`, and later `SSD_0`, `NIC_0`, `BMC_0`, etc.
-- For the current TPU MVP, `TPUDevice` owns child module target objects for PMU, ISI, and DDP.
-- Canonical child target names follow the parent TPU index: `PMU_0`, `ISI_0_0`, `ISI_0_1`, `DDP_0`, then `PMU_1`, `ISI_1_0`, `ISI_1_1`, `DDP_1`.
-- PCIe/DMA and SoC atomic tests stay registered on the parent TPU target.
-- PMU, ISI, and DDP atomic tests are registered on their own module target objects.
+- `ATLAS_0`, `ATLAS_1`, and later `SSD_0`, `NIC_0`, `BMC_0`, etc.
+- For the current TPU MVP, `TPUDevice` is the ATLAS parent device object and owns child module target objects for PCIe, PMU, ISI, DDP, and DMC.
+- Canonical child target names are hierarchical: `ATLAS_0.PCIE_0`, `ATLAS_0.PMU_0`, `ATLAS_0.ISI_0`, `ATLAS_0.DDP_0`, and `ATLAS_0.DDP_0.DMC_0_0`.
+- PCIe/DMA/PHY atomic tests are registered on `PCIeModule`, because PCIe is an explicitly modeled diagnostic module.
+- SoC-named atomic tests stay registered on the parent ATLAS/TPU device only as routed operations through PMU, PCIe, or GPIO index paths.
+- PMU, ISI, DDP, and DMC atomic tests are registered on their own module target objects.
 - Generic helpers such as register read/write, MMIO read/write, pattern generation, and data compare are pure utility APIs, not target devices and not atomic tests.
 - Ignore UART, OpenOCD, and XDE helper placement for now.
 
@@ -41,21 +42,24 @@ Use stable HAL target names as Python/CLI-visible targets:
 Register-window ownership:
 
 - Register windows belong to the device/module object that uses them.
-- `TPUDevice` may hold parent-owned windows such as `pcie_reg_base_`, `pcie_reg_size_`, `soc_reg_base_`, and `soc_reg_size_`.
-- `PMUModule`, `ISIModule`, and `DDPModule` hold their own `reg_base_`, `reg_offset_`, and `reg_size_`.
+- `TPUDevice` should not create fake SoC register windows by default. If a SoC-named test exists, route it through PMU, PCIe, or GPIO-index mechanisms.
+- `PCIeModule`, `PMUModule`, `ISIModule`, `DDPModule`, and `DMCModule` hold their own `reg_base_`, `reg_offset_`, and `reg_size_`.
 - Keep `reg_size_` with `reg_base_` so `common::reg::read/write` can perform range checks.
-- Do not add `memory_reg_base_` or memory-controller register attributes until real MC register atomic tests are identified.
+- DDP owns three DMC controller module objects; DMC register-window attributes belong to each `DMCModule`.
+- Do not add `memory_reg_base_` or unrelated memory-controller register attributes until real MC register atomic tests are identified.
 - Treat device-memory or DMEM windows separately from register windows; use names such as `dev_mem_base` or `dmem_window_base` only when a real data window exists.
 
 `DeviceManager.discover()` should:
 
 - Scan PCI devices.
 - Filter supported TPU VID/DID/revision values.
-- Apply platform policy to map BDF/slot/serial to canonical names such as `TPU_0`.
+- Apply platform policy to map BDF/slot/serial to canonical names such as `ATLAS_0`.
 - mmap required BAR spaces.
-- Construct `TPUDevice` objects and let each TPU construct its PMU/ISI/DDP module targets.
+- Construct `TPUDevice` objects and let each TPU construct its PCIe/PMU/ISI/DDP/DMC module targets.
 - Register every runnable target in one target registry.
-- Return a device tree containing TPU targets plus PMU/ISI/DDP module targets.
+- Return a `DeviceTree` containing ATLAS/TPU devices plus PCIe/PMU/ISI/DDP/DMC module entries. Top entries have `type=TPU`; child entries use module types such as `PCIE_MODULE` or `DMC_MODULE`.
+- Keep BDF as a separate observed field. Do not duplicate BDF inside `locator`; use locator for stable placement facts such as slot, position, serial, or devnode.
+- Do not expose module `reg_offset`, `reg_size`, or raw mapped BAR virtual addresses in the returned `DeviceTree`; those are internal members of the HAL module objects created during discovery.
 - Be called explicitly by CLI/Python before atomic tests run; discovery is not a background side effect.
 
 Common utility boundary:
@@ -93,16 +97,16 @@ Keep headers declaration-only. Put one `_add_test(...)` line per atomic test dir
 Merge equivalent operations into one atomic test and express variants as arguments:
 
 ```python
-hal.run_atomic_test("TPU_0", "pcie_dma_data_transfer", {"direction": "h2d"})
-hal.run_atomic_test("TPU_0", "pcie_dma_data_transfer", {"direction": "d2h"})
-hal.run_atomic_test("TPU_0", "pcie_dma_data_transfer", {"direction": "both"})
-hal.run_atomic_test("ISI_0_0", "isi_linkup", {})
+hal.run_atomic_test("ATLAS_0.PCIE_0", "pcie_dma_data_transfer", {"direction": "h2d"})
+hal.run_atomic_test("ATLAS_0.PCIE_0", "pcie_dma_data_transfer", {"direction": "d2h"})
+hal.run_atomic_test("ATLAS_0.PCIE_0", "pcie_dma_data_transfer", {"direction": "both"})
+hal.run_atomic_test("ATLAS_0.ISI_0", "isi_linkup", {})
 ```
 
 For a CLI-first MVP, prefer a generic one-shot shape before adding per-test custom parsers:
 
 ```bash
-aidiag atomic --device TPU_0 --test pcie_dma_data_transfer --arg direction=h2d --arg size_bytes=4096
+aidiag atomic --device ATLAS_0.PCIE_0 --test pcie_dma_data_transfer --arg direction=h2d --arg size_bytes=4096
 ```
 
 HAL returns observed facts and metrics. Python applies policy, thresholds, and pass/fail criteria.
